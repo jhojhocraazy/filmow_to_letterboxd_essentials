@@ -18,7 +18,7 @@ try:
     from rich.panel import Panel
     from rich.table import Table
 except ImportError:
-    print("Dependências ausentes. Execute: pip install cloudscraper requests beautifulsoup4 rich")
+    print("Dependências ausentes. Execute: py -m pip install -r requirements.txt")
     sys.exit(1)
 
 console = Console()
@@ -46,7 +46,7 @@ CSV_COLUMNS_SINTETICA = (
 CSV_COLUMNS_LETTERBOXD = (
     "imdbID",
     "tmdbID",
-    "filmowRating"
+    "Rating"
 )
 
 CSV_LIMIT = 1900
@@ -54,6 +54,10 @@ REQUEST_DELAY = 1.0
 MAX_RETRIES = 5
 
 def load_tmdb_key():
+    """
+    Função: Garantir a persistência local da credencial de API.
+    Motivo: Isola a chave de acesso do código-fonte (evitando vazamentos no GitHub via .gitignore) e otimiza a execução ao solicitar o dado apenas na primeira inicialização do projeto.
+    """
     key_path = Path("tmdb_key.txt")
     if key_path.exists():
         with open(key_path, "r", encoding="utf-8") as f:
@@ -69,6 +73,10 @@ def load_tmdb_key():
 TMDB_API_KEY = load_tmdb_key()
 
 def get_page(session, url, delay=REQUEST_DELAY):
+    """
+    Função: Executar requisições HTTP blindadas ao servidor do Filmow.
+    Motivo: O Cloudflare impõe bloqueios temporários (Rate Limit 429) e quedas de infraestrutura (Erros 500-524). A função implementa backoff exponencial (espera escalonada) para tentar recuperar a conexão em vez de abortar o scraping em lote.
+    """
     last_response = None
     last_error = None
     
@@ -106,6 +114,10 @@ def get_page(session, url, delay=REQUEST_DELAY):
     raise Exception(f"Falha ao acessar a página após {MAX_RETRIES} tentativas.")
 
 def get_last_page(soup):
+    """
+    Função: Extrair o índice numérico da última página do catálogo.
+    Motivo: Define a margem do loop de repetição, garantindo que o algoritmo itere exatamente até o fim da lista de obras marcadas como assistidas sem gerar erros de requisição fora do limite (out of bounds).
+    """
     pages = [
         int(page)
         for link in soup.select(".pagination a[href]")
@@ -115,6 +127,10 @@ def get_last_page(soup):
     return max(pages, default=1)
 
 def get_total_movies(session, username, delay=REQUEST_DELAY):
+    """
+    Função: Capturar o valor numérico total de marcações no perfil do usuário.
+    Motivo: Fornece um relatório visual de status antes da carga de processamento começar, além de agir como validador de existência da conta no Filmow.
+    """
     profile_url = f"{BASE_URL}/usuario/{username}/"
     soup = get_page(session, profile_url, delay=delay)
     for selector, pattern in (
@@ -130,6 +146,10 @@ def get_total_movies(session, username, delay=REQUEST_DELAY):
     return None
 
 def normalize_text(text):
+    """
+    Função: Limpar ruídos sintáticos de strings (acentuação, diacríticos e numerais romanos).
+    Motivo: É impossível rodar um cálculo matemático de similaridade confiável se as strings divergirem em formatação. O IMDb frequentemente injeta (I), (II) em títulos homônimos que derrubam a acurácia.
+    """
     if not text:
         return ""
     text = re.sub(r'\s*\([IVXLCDM]+\)\s*', '', text)
@@ -137,9 +157,17 @@ def normalize_text(text):
     return text.strip().lower()
 
 def similarity(a, b):
+    """
+    Função: Calcular a razão de identidade entre duas strings de título.
+    Motivo: Opera como pilar de aprovação secundária no motor de confiança, suportando uma aprovação relacional quando ocorrem pequenas inconsistências de cadastro entre as bases do TMDb e do Filmow.
+    """
     return SequenceMatcher(None, a, b).ratio()
 
 def fetch_tmdb(endpoint, params=None):
+    """
+    Função: Despachar as solicitações centralizadas para a API v3 do TMDb.
+    Motivo: Isola o processo de enxerto de credencial em todas as requisições, mitigando também picos excessivos de acessos (Rate Limit 429) do lado do banco de dados remoto sem interromper a fila principal do script.
+    """
     if params is None:
         params = {}
     params['api_key'] = TMDB_API_KEY
@@ -158,6 +186,10 @@ def fetch_tmdb(endpoint, params=None):
     return None
 
 def get_tmdb_details(tmdb_id, media_type="movie"):
+    """
+    Função: Absorver o documento JSON integral da obra do TMDb e unificar suas topologias de nomenclatura.
+    Motivo: Filmes e minisséries na API possuem mapeamentos diferentes (ex: `title` vs `name`, `release_date` vs `first_air_date`). A função exige os apêndices de títulos alternativos e força um esquema padronizado para a auditoria de acurácia.
+    """
     endpoint = f"/{media_type}/{tmdb_id}"
     params = {"append_to_response": "credits,alternative_titles,external_ids", "language": "pt-BR"}
     data = fetch_tmdb(endpoint, params)
@@ -202,6 +234,10 @@ def get_tmdb_details(tmdb_id, media_type="movie"):
     }
 
 def calculate_confidence(candidate, filmow_data):
+    """
+    Função: Atribuir pontuação relacional de aderência entre os dados coletados das duas plataformas.
+    Motivo: Intercepta falsos positivos forçando uma auditoria que exige notas altas baseadas em verificação multidimensional cruzando ano de lançamento, direção e todas as formas traduzidas e originais dos títulos envolvidos.
+    """
     score = 0
     
     f_titles = [normalize_text(t) for t in filmow_data['AllTitles']]
@@ -254,6 +290,10 @@ def calculate_confidence(candidate, filmow_data):
     return score
 
 def resolve_tmdb_by_search(filmow_data):
+    """
+    Função: Desencadear busca manual (Fallback) orientada unicamente pela grafia principal do título.
+    Motivo: Acionada obrigatoriamente caso a página do Filmow sofra omissão do identificador formal (IMDb ID) em seu banco. Exige retorno matemático perfeito da `calculate_confidence` antes de homologar a obra investigada.
+    """
     query = filmow_data['PrimaryTitle']
     best_candidate = None
     best_score = -999
@@ -277,6 +317,10 @@ def resolve_tmdb_by_search(filmow_data):
         return None, best_score
 
 def print_visual_block(tmdb_result, filmow_data, route_type):
+    """
+    Função: Renderizar tabela lógica alinhando propriedades do alvo TMDb vs origem Filmow.
+    Motivo: Confere clareza na auditoria de console durante a extração via biblioteca rich. Modifica bordas e prefixos de log (Verde/Amarelo/Vermelho) apontando instantaneamente a segurança ou omissão da captura.
+    """
     table = Table(show_header=True, header_style="bold magenta", expand=True)
     table.add_column("Atributo", style="cyan", width=12)
     table.add_column("TMDb (Destino)", style="green")
@@ -307,6 +351,10 @@ def print_visual_block(tmdb_result, filmow_data, route_type):
         console.print(panel)
 
 def get_movie(session, path, rating, delay=REQUEST_DELAY):
+    """
+    Função: Varrer a estrutura HTML (DOM) para absorção integral de atributos da página da obra.
+    Motivo: Funciona como o centro operacional da captura local. Envolve a lógica de leitura exaustiva da tag sameAs para o imdbID furtivo em blocos de script, engloba todos os títulos bidimensionais em lista e empacota o retorno que popula os dicionários da exportação final.
+    """
     soup = get_page(session, urljoin(BASE_URL, path), delay=delay)
     
     json_ld_scripts = soup.find_all("script", type="application/ld+json")
@@ -403,6 +451,10 @@ def get_movie(session, path, rating, delay=REQUEST_DELAY):
     }
 
 def get_movies(username, delay=REQUEST_DELAY):
+    """
+    Função: Instanciar raspador persistente com bypass Cloudflare e conduzir paginação macro.
+    Motivo: Orquestra todo o encadeamento assíncrono. Caminha sobre as subdivisões lógicas do usuário, retendo rating explícito nas URLs de grade e repassando o volume bruto aos processadores dedicados a cada nó.
+    """
     session = cloudscraper.create_scraper()
     watched_url = f"{BASE_URL}/usuario/{username}/filmes/ja-vi/"
     first_page = get_page(session, watched_url, delay=delay)
@@ -453,6 +505,10 @@ def get_movies(username, delay=REQUEST_DELAY):
     return movies
 
 def write_csv_files(username, movies, modo):
+    """
+    Função: Consolidar particionamento CSV ignorando colunas obsoletas baseando-se no modo ativo.
+    Motivo: Impede violações sistêmicas ao isolar a saída no subdiretório local de exportação. Replica a nota original temporariamente para forçar aderência exigida pela importação nativa da plataforma Letterboxd.
+    """
     output_directory = Path.cwd() / "exportacoes"
     output_directory.mkdir(parents=True, exist_ok=True)
     
@@ -462,6 +518,8 @@ def write_csv_files(username, movies, modo):
         colunas = CSV_COLUMNS_SINTETICA
     else:
         colunas = CSV_COLUMNS_LETTERBOXD
+        for movie in movies:
+            movie["Rating"] = movie.get("filmowRating")
         
     files = []
     
@@ -484,6 +542,10 @@ def write_csv_files(username, movies, modo):
     return files
 
 def interactive_menu():
+    """
+    Função: Capturar variáveis de intenção interativamente.
+    Motivo: Atua como recurso visual em inicializações limpas no terminal, retendo os dois componentes operacionais exigidos (alvo do scraping e seletor da estrutura do arquivo emitido).
+    """
     console.clear()
     console.print(Panel("[bold cyan]=== Extrator Filmow -> TMDb/Letterboxd ===[/bold cyan]", expand=False))
     usuario = input("Nome de usuário no Filmow: ").strip().lower()
@@ -493,7 +555,7 @@ def interactive_menu():
     console.print("\n[bold]Formatos de Extração:[/bold]")
     console.print("1. Analítica (Todos os metadados)")
     console.print("2. Sintética (Apenas imdbID e tmdbID)")
-    console.print("3. Letterboxd Essencial (Apenas imdbID, tmdbID e filmowRating)")
+    console.print("3. Letterboxd Essencial (Apenas imdbID, tmdbID e Rating)")
     
     opcao = input("Escolha o formato (1, 2 ou 3): ").strip()
     if opcao == "2":
@@ -506,6 +568,10 @@ def interactive_menu():
     return usuario, modo
 
 def main():
+    """
+    Função: Orientar cadeia de processamento central lendo variáveis de inicialização (CLI).
+    Motivo: Ponto de entrada do sistema que prioriza execução baseada em argumentos, acionando o módulo interativo somente quando necessário, e trata encerramentos seguros diante de erros processuais absolutos.
+    """
     parser = argparse.ArgumentParser(description="Exporta filmes assistidos do Filmow reconciliando IDs no TMDb.")
     parser.add_argument("usuario", nargs="?", help="nome de usuário no Filmow")
     parser.add_argument("--modo", choices=["analitica", "sintetica", "letterboxd"], default="analitica", help="formato de exportação do CSV (padrão: analitica)")
