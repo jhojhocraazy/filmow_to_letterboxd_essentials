@@ -1,0 +1,11 @@
+# Segurança da Credencial TMDb
+tmdb_key.txt
+
+# Diretórios de saída e planilhas geradas
+exportacoes/
+*.csv
+
+# Artefatos do Python
+__pycache__/
+*.py[cod]
+*$py.class
