@@ -1,4 +1,5 @@
 tmdb_api.txt
 *.csv
+*.tsv.gz
 relatorio_filmow_*.txt
 __pycache__/
