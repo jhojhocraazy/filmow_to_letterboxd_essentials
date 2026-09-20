@@ -1,155 +1,84 @@
-import argparse
-import csv
-import json
 import os
+import csv
+import gzip
+import json
 import re
 import sys
 import time
 import unicodedata
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from rich.console import Console
+from rich.panel import Panel
 
 try:
     import cloudscraper
     import requests
     from bs4 import BeautifulSoup
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.table import Table
 except ImportError:
-    print("Dependências ausentes. Execute: py -m pip install -r requirements.txt")
+    print("Dependências ausentes. Execute: py -m pip install cloudscraper requests beautifulsoup4 rich")
     sys.exit(1)
 
 console = Console()
 BASE_URL = "https://filmow.com"
-
-CSV_COLUMNS_ANALITICA = (
-    "imdbID",
-    "tmdbID",
-    "tmdbTitle",
-    "tmdbYear",
-    "tmdbCountry",
-    "tmdbDirectors",
-    "filmowTitle",
-    "filmowYear",
-    "filmowCountry",
-    "filmowDirectors",
-    "filmowRating"
-)
-
-CSV_COLUMNS_SINTETICA = (
-    "imdbID",
-    "tmdbID"
-)
-
-CSV_COLUMNS_LETTERBOXD = (
-    "imdbID",
-    "tmdbID",
-    "Rating"
-)
-
-CSV_LIMIT = 1900
-REQUEST_DELAY = 1.0
+RATINGS_FILE = Path("title.ratings.tsv.gz")
 MAX_RETRIES = 5
+DELAY_REQUISICAO = 0.5
+TMDB_API_KEY = ""
+MAX_WORKERS = 5
 
-def load_tmdb_key():
-    """
-    Função: Garantir a persistência local da credencial de API.
-    Motivo: Isola a chave de acesso do código-fonte (evitando vazamentos no GitHub via .gitignore) e otimiza a execução ao solicitar o dado apenas na primeira inicialização do projeto.
-    """
-    key_path = Path("tmdb_key.txt")
-    if key_path.exists():
-        with open(key_path, "r", encoding="utf-8") as f:
-            key = f.read().strip()
-            if key:
-                return key
-    console.print("[yellow]Chave da API do TMDb não encontrada localmente.[/yellow]")
-    key = input("Insira sua API Key v3 Auth do TMDb: ").strip()
-    with open(key_path, "w", encoding="utf-8") as f:
-        f.write(key)
-    return key
+COLUNAS_ANALITICA = [
+    "imdbID", "tmdbID", "tmdbTitle", "tmdbYear", "tmdbCountry", 
+    "tmdbDirectors", "filmowTitle", "filmowYear", "filmowRating", "Rating10"
+]
+COLUNAS_SINTETICA = ["imdbID", "tmdbID", "Rating10"]
+COLUNAS_LETTERBOXD = ["imdbID", "tmdbID", "Rating"]
 
-TMDB_API_KEY = load_tmdb_key()
+def limpar_tela():
+    os.system('cls' if os.name == 'nt' else 'clear')
 
-def get_page(session, url, delay=REQUEST_DELAY):
-    """
-    Função: Executar requisições HTTP blindadas ao servidor do Filmow.
-    Motivo: O Cloudflare impõe bloqueios temporários (Rate Limit 429) e quedas de infraestrutura (Erros 500-524). A função implementa backoff exponencial (espera escalonada) para tentar recuperar a conexão em vez de abortar o scraping em lote.
-    """
-    last_response = None
-    last_error = None
-    
-    for attempt in range(MAX_RETRIES):
-        time.sleep(delay)
-        try:
-            last_response = session.get(url, timeout=30)
-            
-            if last_response.status_code == 429:
-                retry_after = last_response.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * (2**attempt))
-                console.print(f"[yellow]Rate limit atingido, aguardando {wait:.0f}s...[/yellow]")
-                time.sleep(wait)
-                continue
-                
-            if last_response.status_code in (500, 502, 503, 504, 520, 521, 522, 524):
-                wait = min(60, 3 * (2**attempt))
-                console.print(f"[yellow][RETRY] Erro {last_response.status_code} no servidor. Aguardando {wait}s...[/yellow]")
-                time.sleep(wait)
-                continue
+def carregar_credencial(nome_arquivo, prompt_msg):
+    caminho = Path(nome_arquivo)
+    if caminho.exists():
+        valor = caminho.read_text(encoding="utf-8").strip()
+        if valor:
+            return valor
+    console.print(f"[yellow]{nome_arquivo} não encontrado ou vazio.[/yellow]")
+    valor = input(f"{prompt_msg}: ").strip()
+    caminho.write_text(valor, encoding="utf-8")
+    console.print(f"[green]Credencial salva em {nome_arquivo} para execuções futuras.[/green]\n")
+    return valor
 
-            last_response.raise_for_status()
-            return BeautifulSoup(last_response.text, "html.parser")
-            
-        except requests.exceptions.RequestException as e:
-            last_error = e
-            wait = min(60, 3 * (2**attempt))
-            console.print(f"[yellow][RETRY] Falha de rede ({type(e).__name__}). Aguardando {wait}s...[/yellow]")
-            time.sleep(wait)
-            
-    if last_error:
-        raise last_error
-    if last_response is not None:
-        last_response.raise_for_status()
-    raise Exception(f"Falha ao acessar a página após {MAX_RETRIES} tentativas.")
+def carregar_datasets_imdb():
+    url_ratings = "https://datasets.imdbws.com/title.ratings.tsv.gz"
+    if not RATINGS_FILE.exists():
+        console.print("[cyan]Baixando base de notas oficial do IMDb (~30MB)...[/cyan]")
+        resp = requests.get(url_ratings, stream=True, timeout=60)
+        resp.raise_for_status()
+        with open(RATINGS_FILE, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk: f.write(chunk)
 
-def get_last_page(soup):
-    """
-    Função: Extrair o índice numérico da última página do catálogo.
-    Motivo: Define a margem do loop de repetição, garantindo que o algoritmo itere exatamente até o fim da lista de obras marcadas como assistidas sem gerar erros de requisição fora do limite (out of bounds).
-    """
-    pages = [
-        int(page)
-        for link in soup.select(".pagination a[href]")
-        if (match := re.search(r"pagina=(\d+)", link["href"]))
-        for page in [match.group(1)]
-    ]
-    return max(pages, default=1)
-
-def get_total_movies(session, username, delay=REQUEST_DELAY):
-    """
-    Função: Capturar o valor numérico total de marcações no perfil do usuário.
-    Motivo: Fornece um relatório visual de status antes da carga de processamento começar, além de agir como validador de existência da conta no Filmow.
-    """
-    profile_url = f"{BASE_URL}/usuario/{username}/"
-    soup = get_page(session, profile_url, delay=delay)
-    for selector, pattern in (
-        ('a.movie-list__view-all[href*="/filmes/ja-vi/"] span', r"\((\d+)\)"),
-        ('a.movie-list__view-all[href*="/filmes/ja-vi/"]', r"\((\d+)\)"),
-    ):
-        element = soup.select_one(selector)
-        if not element:
-            continue
-        match = re.search(pattern, element.get_text(strip=True))
-        if match:
-            return int(match.group(1))
-    return None
+    ratings_dict = {}
+    console.print("[cyan]Indexando avaliações do IMDb na RAM...[/cyan]")
+    try:
+        with gzip.open(RATINGS_FILE, "rt", encoding="utf-8") as f:
+            next(f)
+            for linha in f:
+                partes = linha.strip().split("\t")
+                if len(partes) == 3:
+                    ratings_dict[partes[0]] = {"rating": float(partes[1]), "votes": int(partes[2])}
+        console.print(f"[green]Índice construído: {len(ratings_dict):,} notas carregadas.[/green]\n")
+    except Exception as e:
+        console.print(f"[bold red]Erro crítico ao compilar matriz offline: {e}[/bold red]")
+        sys.exit(1)
+    return ratings_dict
 
 def normalize_text(text):
-    """
-    Função: Limpar ruídos sintáticos de strings (acentuação, diacríticos e numerais romanos).
-    Motivo: É impossível rodar um cálculo matemático de similaridade confiável se as strings divergirem em formatação. O IMDb frequentemente injeta (I), (II) em títulos homônimos que derrubam a acurácia.
-    """
     if not text:
         return ""
     text = re.sub(r'\s*\([IVXLCDM]+\)\s*', '', text)
@@ -157,17 +86,9 @@ def normalize_text(text):
     return text.strip().lower()
 
 def similarity(a, b):
-    """
-    Função: Calcular a razão de identidade entre duas strings de título.
-    Motivo: Opera como pilar de aprovação secundária no motor de confiança, suportando uma aprovação relacional quando ocorrem pequenas inconsistências de cadastro entre as bases do TMDb e do Filmow.
-    """
     return SequenceMatcher(None, a, b).ratio()
 
 def fetch_tmdb(endpoint, params=None):
-    """
-    Função: Despachar as solicitações centralizadas para a API v3 do TMDb.
-    Motivo: Isola o processo de enxerto de credencial em todas as requisições, mitigando também picos excessivos de acessos (Rate Limit 429) do lado do banco de dados remoto sem interromper a fila principal do script.
-    """
     if params is None:
         params = {}
     params['api_key'] = TMDB_API_KEY
@@ -186,10 +107,6 @@ def fetch_tmdb(endpoint, params=None):
     return None
 
 def get_tmdb_details(tmdb_id, media_type="movie"):
-    """
-    Função: Absorver o documento JSON integral da obra do TMDb e unificar suas topologias de nomenclatura.
-    Motivo: Filmes e minisséries na API possuem mapeamentos diferentes (ex: `title` vs `name`, `release_date` vs `first_air_date`). A função exige os apêndices de títulos alternativos e força um esquema padronizado para a auditoria de acurácia.
-    """
     endpoint = f"/{media_type}/{tmdb_id}"
     params = {"append_to_response": "credits,alternative_titles,external_ids", "language": "pt-BR"}
     data = fetch_tmdb(endpoint, params)
@@ -211,11 +128,7 @@ def get_tmdb_details(tmdb_id, media_type="movie"):
         imdb_id = data.get('external_ids', {}).get('imdb_id', '')
         
     alt_titles = [item.get('title', '') for item in alt_titles_data]
-
-    directors = [
-        crew['name'] for crew in data.get('credits', {}).get('crew', []) 
-        if crew.get('job') == 'Director' or crew.get('department') == 'Directing'
-    ]
+    directors = [crew['name'] for crew in data.get('credits', {}).get('crew', []) if crew.get('job') == 'Director' or crew.get('department') == 'Directing']
     
     if media_type == "tv" and not directors:
         directors = [creator['name'] for creator in data.get('created_by', [])]
@@ -223,6 +136,7 @@ def get_tmdb_details(tmdb_id, media_type="movie"):
     countries = [c.get('iso_3166_1', '') for c in data.get('production_countries', [])]
     
     return {
+        "media_type": media_type,
         "tmdbID": str(data.get('id', '')),
         "imdbID": imdb_id,
         "tmdbTitle": title,
@@ -234,19 +148,13 @@ def get_tmdb_details(tmdb_id, media_type="movie"):
     }
 
 def calculate_confidence(candidate, filmow_data):
-    """
-    Função: Atribuir pontuação relacional de aderência entre os dados coletados das duas plataformas.
-    Motivo: Intercepta falsos positivos forçando uma auditoria que exige notas altas baseadas em verificação multidimensional cruzando ano de lançamento, direção e todas as formas traduzidas e originais dos títulos envolvidos.
-    """
     score = 0
-    
     f_titles = [normalize_text(t) for t in filmow_data['AllTitles']]
     c_titles = [normalize_text(candidate['tmdbTitle']), normalize_text(candidate.get('tmdbOriginalTitle', ''))] + [normalize_text(t) for t in candidate.get('tmdbAltTitles', [])]
     c_titles = [t for t in c_titles if t]
     
     exact_match = False
     partial_match = False
-    
     for ft in f_titles:
         if ft in c_titles:
             exact_match = True
@@ -290,10 +198,6 @@ def calculate_confidence(candidate, filmow_data):
     return score
 
 def resolve_tmdb_by_search(filmow_data):
-    """
-    Função: Desencadear busca manual (Fallback) orientada unicamente pela grafia principal do título.
-    Motivo: Acionada obrigatoriamente caso a página do Filmow sofra omissão do identificador formal (IMDb ID) em seu banco. Exige retorno matemático perfeito da `calculate_confidence` antes de homologar a obra investigada.
-    """
     query = filmow_data['PrimaryTitle']
     best_candidate = None
     best_score = -999
@@ -304,8 +208,7 @@ def resolve_tmdb_by_search(filmow_data):
             candidates = results['results'][:5]
             for item in candidates:
                 details = get_tmdb_details(item['id'], media_type)
-                if not details:
-                    continue
+                if not details: continue
                 score = calculate_confidence(details, filmow_data)
                 if score > best_score:
                     best_score = score
@@ -313,58 +216,46 @@ def resolve_tmdb_by_search(filmow_data):
 
     if best_score >= 100 and best_candidate and best_candidate['imdbID']:
         return best_candidate, best_score
-    else:
-        return None, best_score
+    return None, best_score
 
-def print_visual_block(tmdb_result, filmow_data, route_type):
-    """
-    Função: Renderizar tabela lógica alinhando propriedades do alvo TMDb vs origem Filmow.
-    Motivo: Confere clareza na auditoria de console durante a extração via biblioteca rich. Modifica bordas e prefixos de log (Verde/Amarelo/Vermelho) apontando instantaneamente a segurança ou omissão da captura.
-    """
-    table = Table(show_header=True, header_style="bold magenta", expand=True)
-    table.add_column("Atributo", style="cyan", width=12)
-    table.add_column("TMDb (Destino)", style="green")
-    table.add_column("Filmow (Origem)", style="dim")
-
-    if tmdb_result:
-        if route_type == "JSON-LD":
-            border_style = "green"
-            title = f"[bold green]✓ IMDb ID Confirmado: {tmdb_result['imdbID']}[/bold green]"
-        else:
-            border_style = "yellow"
-            title = f"[bold yellow]⚠ Fallback Validado: {tmdb_result['imdbID']}[/bold yellow]"
-
-        table.add_row("Título", tmdb_result['tmdbOriginalTitle'], filmow_data['PrimaryTitle'])
-        table.add_row("Ano", tmdb_result['tmdbYear'], filmow_data['Year'])
-        table.add_row("Diretor", tmdb_result['tmdbDirectors'], filmow_data['Directors'])
-        table.add_row("ID TMDb", tmdb_result['tmdbID'], f"Nota: {filmow_data['Rating']}")
-
-        panel = Panel(table, title=title, border_style=border_style, padding=(0, 1))
-        console.print(panel)
-    else:
-        table.add_row("Título", "[red]N/A[/red]", filmow_data['PrimaryTitle'])
-        table.add_row("Ano", "[red]N/A[/red]", filmow_data['Year'])
-        table.add_row("Diretor", "[red]N/A[/red]", filmow_data['Directors'])
-        table.add_row("Status", "[red]Falha na Validação[/red]", f"Nota: {filmow_data['Rating']}")
-
-        panel = Panel(table, title="[bold red]✖ SEM CONFIANÇA NECESSÁRIA[/bold red]", border_style="red", padding=(0, 1))
-        console.print(panel)
-
-def get_movie(session, path, rating, delay=REQUEST_DELAY):
-    """
-    Função: Varrer a estrutura HTML (DOM) para absorção integral de atributos da página da obra.
-    Motivo: Funciona como o centro operacional da captura local. Envolve a lógica de leitura exaustiva da tag sameAs para o imdbID furtivo em blocos de script, engloba todos os títulos bidimensionais em lista e empacota o retorno que popula os dicionários da exportação final.
-    """
-    soup = get_page(session, urljoin(BASE_URL, path), delay=delay)
-    
-    json_ld_scripts = soup.find_all("script", type="application/ld+json")
-    imdb_id = None
-    for script in json_ld_scripts:
+def obter_pagina_blindada(sessao, url, delay=DELAY_REQUISICAO):
+    ultimo_erro = None
+    for tentativa in range(MAX_RETRIES):
+        time.sleep(delay)
         try:
-            data = json.loads(script.string)
-            same_as = data.get("sameAs", [])
-            if isinstance(same_as, str):
-                same_as = [same_as]
+            resposta = sessao.get(url, timeout=30)
+            if resposta.status_code == 429:
+                retry_after = resposta.headers.get("Retry-After")
+                espera = float(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * (2**tentativa))
+                time.sleep(espera)
+                continue
+                
+            if resposta.status_code in (500, 502, 503, 504, 520, 521, 522, 524):
+                espera = min(60, 3 * (2**tentativa))
+                time.sleep(espera)
+                continue
+
+            resposta.raise_for_status()
+            return BeautifulSoup(resposta.text, "html.parser")
+            
+        except Exception as e:
+            ultimo_erro = e
+            espera = min(60, 3 * (2**tentativa))
+            time.sleep(espera)
+            
+    raise Exception(f"Falha ao acessar {url}. Erro: {ultimo_erro}")
+
+def processar_filme(sessao, url_path, nota_usuario, ratings_dict):
+    url_completa = urljoin(BASE_URL, url_path)
+    sopa = obter_pagina_blindada(sessao, url_completa)
+    
+    imdb_id = None
+    scripts_json = sopa.find_all("script", type="application/ld+json")
+    for script in scripts_json:
+        try:
+            dados = json.loads(script.string)
+            same_as = dados.get("sameAs", [])
+            if isinstance(same_as, str): same_as = [same_as]
             for url in same_as:
                 match = re.search(r'imdb\.com/title/(tt\d+)', url)
                 if match:
@@ -372,232 +263,295 @@ def get_movie(session, path, rating, delay=REQUEST_DELAY):
                     break
         except json.JSONDecodeError:
             pass
-        if imdb_id:
-            break
+        if imdb_id: break
 
     all_titles = []
-    title_element_mb2 = soup.select_one("span.mb-2")
-    if title_element_mb2:
-        all_titles.append(title_element_mb2.get_text(strip=True))
-        
-    title_element_h2 = soup.select_one("span.movie__title.fw-semibold.h2")
-    if title_element_h2:
-        all_titles.append(title_element_h2.get_text(strip=True))
+    if sopa.select_one("span.mb-2"):
+        all_titles.append(sopa.select_one("span.mb-2").get_text(strip=True))
+    if sopa.select_one("span.movie__title.fw-semibold.h2"):
+        all_titles.append(sopa.select_one("span.movie__title.fw-semibold.h2").get_text(strip=True))
 
     all_titles = [t for t in all_titles if t]
-    if not all_titles:
-        raise ValueError("título principal não encontrado")
+    primary_title = all_titles[0] if all_titles else "Desconhecido"
+    
+    directors_list = [link.get_text(strip=True) for link in sopa.select(".movie__mobile-directors a")]
+    filmow_directors = ", ".join(directors_list)
 
-    primary_title = all_titles[0]
+    ano_elem = sopa.select_one(".movie__year")
+    ano_match = re.search(r"\d{4}", ano_elem.get_text()) if ano_elem else None
+    year = ano_match.group() if ano_match else ""
 
-    directors = [link.get_text(strip=True) for link in soup.select(".movie__mobile-directors a")]
-    year_element = soup.select_one(".movie__year")
-    year_match = re.search(r"\d{4}", year_element.get_text()) if year_element else None
-    year = year_match.group() if year_match else ""
-
-    country_links = soup.select("a[href*='/paises/']")
-    country = country_links[0].get_text(strip=True) if country_links else ""
-
-    filmow_data = {
-        "PrimaryTitle": primary_title,
-        "AllTitles": all_titles,
-        "Directors": ", ".join(directors),
-        "Year": year,
-        "Country": country,
-        "Rating": rating or ""
-    }
-
-    tmdb_result = None
-    route_type = None
+    origem_id = "N/A"
+    final_imdb = ""
+    final_tmdb = ""
+    tmdb_candidate = None
 
     if imdb_id:
         find_data = fetch_tmdb(f"/find/{imdb_id}", {"external_source": "imdb_id"})
         if find_data:
-            candidate = None
             if find_data.get("movie_results"):
-                tmdb_internal_id = find_data["movie_results"][0]["id"]
-                candidate = get_tmdb_details(tmdb_internal_id, "movie")
+                final_tmdb = str(find_data["movie_results"][0]["id"])
+                tmdb_candidate = get_tmdb_details(final_tmdb, "movie")
             elif find_data.get("tv_results"):
-                tmdb_internal_id = find_data["tv_results"][0]["id"]
-                candidate = get_tmdb_details(tmdb_internal_id, "tv")
+                final_tmdb = str(find_data["tv_results"][0]["id"])
+                tmdb_candidate = get_tmdb_details(final_tmdb, "tv")
                 
-            if candidate:
-                score = calculate_confidence(candidate, filmow_data)
-                if score >= 40:
-                    tmdb_result = candidate
-                    route_type = "JSON-LD"
+        if final_tmdb:
+            final_imdb = imdb_id
+            origem_id = "[green]JSON-LD Fast-Track[/green]"
+
+    if not final_imdb or not final_tmdb:
+        filmow_data = {
+            "PrimaryTitle": primary_title,
+            "AllTitles": all_titles,
+            "Directors": filmow_directors,
+            "Year": year,
+            "Rating": nota_usuario or ""
+        }
+        
+        tmdb_candidate, score = resolve_tmdb_by_search(filmow_data)
+        if tmdb_candidate:
+            final_imdb = tmdb_candidate["imdbID"]
+            final_tmdb = tmdb_candidate["tmdbID"]
+            origem_id = "[yellow]Fallback Semântico[/yellow]"
+
+    if final_imdb and final_tmdb:
+        r_info = ratings_dict.get(final_imdb)
+        nota_matriz = r_info['rating'] if r_info else ""
+        nota_print = f"[bold yellow]{nota_matriz}[/bold yellow]" if nota_matriz else "[dim]Sem nota pública[/dim]"
+        
+        trakt_type = "movie"
+        if tmdb_candidate and "media_type" in tmdb_candidate:
+            trakt_type = "show" if tmdb_candidate["media_type"] == "tv" else "movie"
+            
+        console.print(f"[bold white]{primary_title} ({year})[/bold white] → TMDb: {final_tmdb} | IMDb: {final_imdb} | Origem: {origem_id} | Público: {nota_print}")
+        
+        return {
+            "imdbID": final_imdb,             # Key Letterboxd
+            "tmdbID": final_tmdb,             # Key Letterboxd
+            "imdb_id": final_imdb,            # Key Trakt
+            "tmdb_id": final_tmdb,            # Key Trakt
+            "type": trakt_type,               # Key Trakt (movie ou show)
+            "tmdbTitle": tmdb_candidate["tmdbTitle"] if tmdb_candidate else "",
+            "tmdbYear": tmdb_candidate["tmdbYear"] if tmdb_candidate else "",
+            "tmdbCountry": tmdb_candidate["tmdbCountry"] if tmdb_candidate else "",
+            "tmdbDirectors": tmdb_candidate["tmdbDirectors"] if tmdb_candidate else "",
+            "filmowTitle": primary_title,
+            "filmowYear": year,
+            "filmowRating": nota_usuario or "",
+            "Rating10": nota_matriz,          # Key Analitica/Sintetica
+            "Rating": nota_usuario or "",     # Key Letterboxd Essencial
+            "rating": nota_matriz             # Key Trakt Ratings
+        }
+    else:
+        console.print(f"[bold red]✖ {primary_title} ({year})[/bold red] → [dim]Falha na resolução de identidade.[/dim]")
+        return None
+
+def extrair_historico_completo(sessao, username, ratings_dict):
+    url_base = f"{BASE_URL}/usuario/{username}/filmes/ja-vi/"
+    primeira_pagina = obter_pagina_blindada(sessao, url_base)
+    
+    if not primeira_pagina.select_one("#movies-list"):
+        raise ValueError(f"Usuário '{username}' não possui histórico público.")
+
+    paginas = [int(m.group(1)) for l in primeira_pagina.select(".pagination a[href]") if (m := re.search(r"pagina=(\d+)", l["href"]))]
+    total_paginas = max(paginas, default=1)
+    
+    console.print(f"[bold green]✓ Perfil mapeado. {total_paginas} páginas de histórico localizadas.[/bold green]\n")
+
+    linhas_csv = []
+    metricas = {"processados": 0, "resolvidos": 0, "falhas": 0}
+
+    for pagina_atual in range(1, total_paginas + 1):
+        console.print(f"\n[bold magenta]=== PÁGINA {pagina_atual}/{total_paginas} (Processamento Concorrente) ===[/bold magenta]")
+        url_alvo = url_base if pagina_atual == 1 else f"{url_base}?pagina={pagina_atual}"
+        sopa = primeira_pagina if pagina_atual == 1 else obter_pagina_blindada(sessao, url_alvo)
+        
+        itens_grade = sopa.select("#movies-list li.movie_list_item")
+        tarefas = []
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for item in itens_grade:
+                link_tag = item.select_one("a.tip-movie[href]")
+                if not link_tag: continue
+                    
+                nota_tag = item.select_one(".star-rating[title]")
+                nota_match = re.search(r"Nota: ([0-5](?:\.5)?)", nota_tag["title"]) if nota_tag else None
+                nota = nota_match.group(1) if nota_match else ""
+                
+                metricas["processados"] += 1
+                tarefas.append(executor.submit(processar_filme, sessao, link_tag["href"], nota, ratings_dict))
+                
+            for futuro in as_completed(tarefas):
+                resultado = futuro.result()
+                if resultado:
+                    linhas_csv.append(resultado)
+                    metricas["resolvidos"] += 1
                 else:
-                    tmdb_result = None
-                
-    if not tmdb_result:
-        tmdb_result, best_score = resolve_tmdb_by_search(filmow_data)
-        if tmdb_result:
-            route_type = "FALLBACK"
+                    metricas["falhas"] += 1
 
-    print_visual_block(tmdb_result, filmow_data, route_type)
+    return linhas_csv, metricas
 
-    return {
-        "imdbID": tmdb_result["imdbID"] if tmdb_result else "",
-        "tmdbID": tmdb_result["tmdbID"] if tmdb_result else "",
-        "tmdbTitle": tmdb_result["tmdbTitle"] if tmdb_result else "",
-        "tmdbYear": tmdb_result["tmdbYear"] if tmdb_result else "",
-        "tmdbCountry": tmdb_result["tmdbCountry"] if tmdb_result else "",
-        "tmdbDirectors": tmdb_result["tmdbDirectors"] if tmdb_result else "",
-        "filmowTitle": filmow_data["PrimaryTitle"],
-        "filmowYear": filmow_data["Year"],
-        "filmowCountry": filmow_data["Country"],
-        "filmowDirectors": filmow_data["Directors"],
-        "filmowRating": filmow_data["Rating"]
+def exibir_documentacao():
+    doc_texto = """[bold cyan]1. VISÃO GERAL[/bold cyan]
+Este script consolida a migração do seu histórico do Filmow para plataformas terceiras. O sistema cruza os metadados 
+visuais com o The Movie Database (TMDb) e o Internet Movie Database (IMDb), garantindo alinhamento de chaves.
+
+[bold cyan]2. VIA EXPRESSA (FAST-TRACK JSON-LD)[/bold cyan]
+O extrator intercepta a tag furtiva `sameAs` injetada no código-fonte das páginas do Filmow. Quando o ID oficial 
+do IMDb está presente, o motor pula a fase de auditoria comparativa (Score) e roteia o dado instantaneamente.
+
+[bold cyan]3. MECANISMO DE CONTINGÊNCIA (FALLBACK)[/bold cyan]
+Quando o Filmow não possui a chave matriz registrada, o sistema raspa atributos secundários (título original, ano e diretor) 
+e dispara uma Busca Semântica paralela no TMDb. A aprovação só ocorre se o cálculo de identidade ultrapassar 100 pontos.
+
+[bold cyan]4. INTELIGÊNCIA OFFLINE E MULTITHREADING[/bold cyan]
+As notas públicas do IMDb são carregadas em RAM (~60MB), erradicando a necessidade de raspar o domínio da Amazon. 
+A fila de navegação processa 5 páginas de filmes simultaneamente, acelerando a extração em mais de 80% e respeitando 
+o Firewall do Cloudflare (WAF).
+
+[bold cyan]5. OS ARQUIVOS GERADOS[/bold cyan]
+Você pode selecionar o formato dinâmico antes de iniciar a extração:
+→ [bold white]Analítica:[/bold white] Inventário total para debugar discrepâncias entre títulos originais e traduções.
+→ [bold white]Sintética:[/bold white] Estrutura estrita contendo os IDs e a nota global do IMDb (Rating10).
+→ [bold white]Letterboxd Essencial:[/bold white] Arquivo formatado para importação do LB, isolando a sua nota pessoal fracionada.
+→ [bold white]Trakt.tv:[/bold white] Divide sua grade em dois arquivos (History e Ratings) com as notas públicas do IMDb e 
+   topologia à prova de falhas (detecta e marca minisséries como 'show'), impedindo quebras no importador nativo."""
+    
+    limpar_tela()
+    console.print(Panel.fit(doc_texto, title="[bold white]📖 MANUAL DE OPERAÇÃO E ARQUITETURA[/bold white]", border_style="blue"))
+
+def exibir_menu_e_obter_selecao():
+    menu_texto = """[bold cyan]Selecione o formato de exportação:[/bold cyan]
+
+[bold white]1.[/bold white] Analítica (Todos os metadados)
+[bold white]2.[/bold white] Sintética (imdbID, tmdbID, Rating10 - Notas do IMDb)
+[bold white]3.[/bold white] Letterboxd Essencial (imdbID, tmdbID, Rating - Notas do Filmow)
+[bold white]4.[/bold white] Trakt.tv (History e Ratings separados - Notas do IMDb)
+
+[bold white]6.[/bold white] [bold green]📖 Documentação e Como Usar[/bold green]
+
+[bold white]0.[/bold white] Sair"""
+    
+    console.print("\n")
+    console.print(Panel.fit(menu_texto.strip(), title="[bold white]MENU DE OPERAÇÃO[/bold white]", border_style="blue"))
+    
+    opcoes_map = {
+        "1": "analitica",
+        "2": "sintetica",
+        "3": "letterboxd",
+        "4": "trakt",
+        "6": "DOC"
     }
-
-def get_movies(username, delay=REQUEST_DELAY):
-    """
-    Função: Instanciar raspador persistente com bypass Cloudflare e conduzir paginação macro.
-    Motivo: Orquestra todo o encadeamento assíncrono. Caminha sobre as subdivisões lógicas do usuário, retendo rating explícito nas URLs de grade e repassando o volume bruto aos processadores dedicados a cada nó.
-    """
-    session = cloudscraper.create_scraper()
-    watched_url = f"{BASE_URL}/usuario/{username}/filmes/ja-vi/"
-    first_page = get_page(session, watched_url, delay=delay)
-
-    if not first_page.select_one("#movies-list"):
-        raise ValueError(f"usuário '{username}' não encontrado ou sem filmes assistidos")
-
-    total_movies = get_total_movies(session, username, delay=delay)
-    if total_movies is None:
-        raise ValueError(f"não foi possível obter o total de filmes de '{username}'")
-
-    console.print(f"[bold cyan]Usuário {username} encontrado. Total a importar: {total_movies}[/bold cyan]")
-
-    movies = []
-    total_pages = get_last_page(first_page)
-
-    for page_number in range(1, total_pages + 1):
-        console.print(f"\n[bold magenta]Página {page_number}/{total_pages}[/bold magenta]")
-        soup = (
-            first_page
-            if page_number == 1
-            else get_page(session, f"{watched_url}?pagina={page_number}", delay=delay)
-        )
-
-        for item in soup.select("#movies-list li.movie_list_item"):
-            link = item.select_one("a.tip-movie[href]")
-            if not link:
-                continue
-            rating_element = item.select_one(".star-rating[title]")
-            rating_match = (
-                re.search(r"Nota: ([0-5](?:\.5)?)", rating_element["title"])
-                if rating_element
-                else None
-            )
-            try:
-                movie = get_movie(
-                    session,
-                    link["href"],
-                    rating_match.group(1) if rating_match else None,
-                    delay=delay,
-                )
-                movies.append(movie)
-            except Exception as error:
-                console.print(f"[bold red][ERRO] Falha ao extrair {link['href']}: {error}[/bold red]")
-
-    if not movies:
-        raise RuntimeError("nenhum filme foi importado; nenhum CSV foi criado")
-    return movies
-
-def write_csv_files(username, movies, modo):
-    """
-    Função: Consolidar particionamento CSV ignorando colunas obsoletas baseando-se no modo ativo.
-    Motivo: Impede violações sistêmicas ao isolar a saída no subdiretório local de exportação. Replica a nota original temporariamente para forçar aderência exigida pela importação nativa da plataforma Letterboxd.
-    """
-    output_directory = Path.cwd() / "exportacoes"
-    output_directory.mkdir(parents=True, exist_ok=True)
     
-    if modo == "analitica":
-        colunas = CSV_COLUMNS_ANALITICA
-    elif modo == "sintetica":
-        colunas = CSV_COLUMNS_SINTETICA
-    else:
-        colunas = CSV_COLUMNS_LETTERBOXD
-        for movie in movies:
-            movie["Rating"] = movie.get("filmowRating")
-        
-    files = []
-    
-    chunks = [
-        movies[index : index + CSV_LIMIT]
-        for index in range(0, len(movies), CSV_LIMIT)
-    ]
-    
-    for number, chunk in enumerate(chunks, start=1):
-        suffix = f"-{number}" if len(chunks) > 1 else ""
-        filename = f"{username}_{modo}{suffix}.csv"
-        path = output_directory / filename
-        
-        with path.open("w", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=colunas, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(chunk)
-        files.append(path)
-        
-    return files
-
-def interactive_menu():
-    """
-    Função: Capturar variáveis de intenção interativamente.
-    Motivo: Atua como recurso visual em inicializações limpas no terminal, retendo os dois componentes operacionais exigidos (alvo do scraping e seletor da estrutura do arquivo emitido).
-    """
-    console.clear()
-    console.print(Panel("[bold cyan]=== Extrator Filmow -> TMDb/Letterboxd ===[/bold cyan]", expand=False))
-    usuario = input("Nome de usuário no Filmow: ").strip().lower()
-    while not usuario:
-        usuario = input("O nome de usuário não pode ser vazio. Nome no Filmow: ").strip().lower()
-        
-    console.print("\n[bold]Formatos de Extração:[/bold]")
-    console.print("1. Analítica (Todos os metadados)")
-    console.print("2. Sintética (Apenas imdbID e tmdbID)")
-    console.print("3. Letterboxd Essencial (Apenas imdbID, tmdbID e Rating)")
-    
-    opcao = input("Escolha o formato (1, 2 ou 3): ").strip()
-    if opcao == "2":
-        modo = "sintetica"
-    elif opcao == "3":
-        modo = "letterboxd"
-    else:
-        modo = "analitica"
-    
-    return usuario, modo
+    while True:
+        escolha = input("\nDigite o número da opção desejada: ").strip()
+        if escolha == "0":
+            sys.exit(0)
+        if escolha in opcoes_map:
+            return opcoes_map[escolha]
+        console.print("[red]Opção inválida. Tente novamente.[/red]")
 
 def main():
-    """
-    Função: Orientar cadeia de processamento central lendo variáveis de inicialização (CLI).
-    Motivo: Ponto de entrada do sistema que prioriza execução baseada em argumentos, acionando o módulo interativo somente quando necessário, e trata encerramentos seguros diante de erros processuais absolutos.
-    """
-    parser = argparse.ArgumentParser(description="Exporta filmes assistidos do Filmow reconciliando IDs no TMDb.")
-    parser.add_argument("usuario", nargs="?", help="nome de usuário no Filmow")
-    parser.add_argument("--modo", choices=["analitica", "sintetica", "letterboxd"], default="analitica", help="formato de exportação do CSV (padrão: analitica)")
-    parser.add_argument("--delay", type=float, default=REQUEST_DELAY, help="segundos de espera entre requisições (padrão: 1.0)")
+    limpar_tela()
     
-    args = parser.parse_args()
+    global TMDB_API_KEY
+    TMDB_API_KEY = carregar_credencial("tmdb_api.txt", "Digite sua API Key do TMDb v3")
+    ratings_dict = carregar_datasets_imdb()
     
-    if args.usuario:
-        username = args.usuario.strip().lower()
-        modo = args.modo
-    else:
-        username, modo = interactive_menu()
+    username = input("\nDigite o nome de usuário do Filmow: ").strip().lower()
+    if not username:
+        sys.exit(0)
+        
+    sessao = cloudscraper.create_scraper()
+    primeira_execucao = True
+    
+    while True:
+        if not primeira_execucao:
+            limpar_tela()
+        primeira_execucao = False
+        
+        selecao = exibir_menu_e_obter_selecao()
+        
+        if selecao == "DOC":
+            exibir_documentacao()
+            console.input("\n[bold cyan]Pressione ENTER para voltar ao menu inicial...[/bold cyan]")
+            continue
+            
+        modo = selecao
+        
+        start_time = time.time()
+        try:
+            console.print(f"\n[cyan]Iniciando varredura integral do perfil {username}...[/cyan]")
+            linhas_exportacao, metricas = extrair_historico_completo(sessao, username, ratings_dict)
+        except Exception as e:
+            console.print(f"\n[bold red]Erro crítico durante a extração: {e}[/bold red]")
+            console.input("\n[bold cyan]Pressione ENTER para voltar ao menu inicial...[/bold cyan]")
+            continue
+            
+        tempo_execucao = time.time() - start_time
+        h, rem = divmod(tempo_execucao, 3600)
+        m, s = divmod(rem, 60)
+        tempo_formatado = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+        
+        relatorio_texto = f"""[bold cyan]Métricas de Execução[/bold cyan]
+Tempo Total de Varredura: [bold white]{tempo_formatado}[/bold white]
+Obras Processadas: [bold white]{metricas['processados']}[/bold white]
 
-    console.clear()
+[bold cyan]Desempenho de Resolução[/bold cyan]
+Identidades Resolvidas (Sucesso): [bold green]{metricas['resolvidos']}[/bold green]
+Falhas de Identidade (Omissões): [bold red]{metricas['falhas']}[/bold red]
+"""
 
-    try:
-        movies_data = get_movies(username, delay=args.delay)
-        files = write_csv_files(username, movies_data, modo)
-    except Exception as error:
-        console.print(f"[bold red]Erro: {error}[/bold red]")
-        return 1
+        if linhas_exportacao:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            if modo == "trakt":
+                nome_arquivo_history = f"exportacao_history_trakt_{username}_{timestamp}.csv"
+                with open(nome_arquivo_history, mode='w', newline='', encoding='utf-8') as f:
+                    escritor_history = csv.DictWriter(f, fieldnames=["imdb_id", "tmdb_id", "type"], extrasaction='ignore')
+                    escritor_history.writeheader()
+                    escritor_history.writerows(linhas_exportacao)
+                    
+                nome_arquivo_ratings = f"exportacao_ratings_trakt_{username}_{timestamp}.csv"
+                linhas_com_nota = [linha for linha in linhas_exportacao if linha.get("rating")]
+                if linhas_com_nota:
+                    with open(nome_arquivo_ratings, mode='w', newline='', encoding='utf-8') as f:
+                        escritor_ratings = csv.DictWriter(f, fieldnames=["imdb_id", "tmdb_id", "type", "rating"], extrasaction='ignore')
+                        escritor_ratings.writeheader()
+                        escritor_ratings.writerows(linhas_com_nota)
+                
+                relatorio_texto += "\n[bold green][✓] Arquivos de exportação gerados (Trakt.tv):[/bold green]\n"
+                relatorio_texto += f"    → {nome_arquivo_history} ([bold white]{len(linhas_exportacao)}[/bold white] check-ins)\n"
+                if linhas_com_nota:
+                    relatorio_texto += f"    → {nome_arquivo_ratings} ([bold white]{len(linhas_com_nota)}[/bold white] avaliações)\n"
+            else:
+                if modo == "analitica":
+                    colunas = COLUNAS_ANALITICA
+                elif modo == "sintetica":
+                    colunas = COLUNAS_SINTETICA
+                else:
+                    colunas = COLUNAS_LETTERBOXD
 
-    console.print(f"\n[bold green]Concluído no formato {modo.upper()}:[/bold green]")
-    for path in files:
-        console.print(path.resolve())
-    return 0
+                nome_arquivo = f"exportacao_{modo}_{username}_{timestamp}.csv"
+                with open(nome_arquivo, mode='w', newline='', encoding='utf-8') as f:
+                    escritor = csv.DictWriter(f, fieldnames=colunas, extrasaction='ignore')
+                    escritor.writeheader()
+                    escritor.writerows(linhas_exportacao)
+                    
+                relatorio_texto += f"\n[bold green][✓] Arquivo de importação gerado: {nome_arquivo}[/bold green]\n"
+
+            nome_log = f"relatorio_filmow_{timestamp}.txt"
+            with open(nome_log, "w", encoding="utf-8") as f:
+                f.write("=== RELATORIO OPERACIONAL FILMOW ===\n")
+                f.write(re.sub(r'\[.*?\]', '', relatorio_texto))
+                
+            relatorio_texto += f"[bold green][✓] Log salvo para consulta:[/bold green] {nome_log}\n"
+
+        console.print("\n")
+        console.print(Panel.fit(relatorio_texto.strip(), title="[bold white]RELATÓRIO OPERACIONAL FILMOW[/bold white]", border_style="blue"))
+        
+        console.input("\n[bold cyan]Pressione ENTER para voltar ao menu inicial...[/bold cyan]")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

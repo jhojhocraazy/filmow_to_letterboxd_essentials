@@ -1,11 +1,4 @@
-# Segurança da Credencial TMDb
-tmdb_key.txt
-
-# Diretórios de saída e planilhas geradas
-exportacoes/
+tmdb_api.txt
 *.csv
-
-# Artefatos do Python
+relatorio_filmow_*.txt
 __pycache__/
-*.py[cod]
-*$py.class
