@@ -28,22 +28,63 @@ A chave é solicitada na primeira execução e salva localmente em `tmdb_api.txt
 
 ## Instalação
 
-Recomendamos um ambiente virtual:
+### 1. Obter o projeto
+
+O comando abaixo clona o código dentro da pasta atual. O ponto final (`.`) é importante: ele evita criar uma subpasta com outro nome.
+
+```powershell
+cd C:\\Users\\Administrator\\Downloads\\Teste
+git clone https://github.com/jhojhocraazy/filmow_to_letterboxd_essentials.git .
+```
+
+Confirme que os arquivos necessários estão presentes:
+
+```powershell
+Test-Path requirements.txt
+Test-Path filmow_to_letterboxd_essentials.py
+```
+
+Os dois comandos devem retornar `True`. Se você criou o ambiente virtual antes de clonar o projeto, remova apenas o `.venv`, clone o repositório e crie o ambiente novamente:
+
+```powershell
+deactivate
+Remove-Item -Recurse -Force .venv
+git clone https://github.com/jhojhocraazy/filmow_to_letterboxd_essentials.git .
+```
+
+### 2. Criar o ambiente virtual
+
+O ambiente virtual fica dentro da pasta do projeto, mas não contém o código-fonte. Por isso, `requirements.txt` e `filmow_to_letterboxd_essentials.py` devem existir antes de executar a instalação.
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
+```
+
+O prompt deve mostrar `(.venv)`. Se a ativação for bloqueada pelo PowerShell, execute o Python diretamente pelo ambiente:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Se a ativação funcionar, os comandos equivalentes são:
+
+```powershell
 py -m pip install --upgrade pip
 py -m pip install -r requirements.txt
 ```
 
-Se a ativação for bloqueada pelo PowerShell, execute o Python diretamente pelo ambiente:
+### 3. Validar a instalação
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+py -m unittest discover -s tests -v
+py -m pip check
 ```
 
 ## Como executar
+
+Depois da instalação, execute com o ambiente virtual ativo:
 
 ```powershell
 py filmow_to_letterboxd_essentials.py
