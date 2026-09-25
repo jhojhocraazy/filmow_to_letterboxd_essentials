@@ -26,68 +26,104 @@ O relatório analítico é o formato indicado para conferir se os títulos, anos
 
 A chave é solicitada na primeira execução e salva localmente em `tmdb_api.txt`. Esse arquivo é ignorado pelo Git e nunca deve ser enviado para o repositório.
 
-## Instalação
+## Instalação no Windows
 
-### 1. Obter o projeto
+### 1. Escolha uma pasta para o projeto
 
-O comando abaixo clona o código dentro da pasta atual. O ponto final (`.`) é importante: ele evita criar uma subpasta com outro nome.
+Abra o PowerShell e escolha uma pasta dedicada para guardar o projeto. O caminho pode ser qualquer um disponível na sua máquina.
+
+Este exemplo cria uma pasta dentro da sua pasta de usuário:
 
 ```powershell
-cd C:\\Users\\Administrator\\Downloads\\Teste
+$Projeto = "$HOME\MeusProjetos\filmow_to_letterboxd_essentials"
+New-Item -ItemType Directory -Path $Projeto
+Set-Location $Projeto
+```
+
+Se você já possui uma pasta de projetos, pode usá-la. Evite escolher uma pasta que contenha arquivos importantes ou outro projeto.
+
+### 2. Obtenha o projeto
+
+Com o PowerShell dentro da pasta escolhida, clone o repositório:
+
+```powershell
 git clone https://github.com/jhojhocraazy/filmow_to_letterboxd_essentials.git .
 ```
 
-Confirme que os arquivos necessários estão presentes:
+O ponto final `.` instala o projeto diretamente na pasta escolhida.
+
+Confirme que os arquivos foram copiados:
 
 ```powershell
 Test-Path requirements.txt
 Test-Path filmow_to_letterboxd_essentials.py
 ```
 
-Os dois comandos devem retornar `True`. Se você criou o ambiente virtual antes de clonar o projeto, remova apenas o `.venv`, clone o repositório e crie o ambiente novamente:
+Os dois comandos devem retornar `True`. Se retornarem `False`, verifique se o PowerShell está na pasta correta.
 
-```powershell
-deactivate
-Remove-Item -Recurse -Force .venv
-git clone https://github.com/jhojhocraazy/filmow_to_letterboxd_essentials.git .
-```
+### 3. Crie o ambiente virtual
 
-### 2. Criar o ambiente virtual
-
-O ambiente virtual fica dentro da pasta do projeto, mas não contém o código-fonte. Por isso, `requirements.txt` e `filmow_to_letterboxd_essentials.py` devem existir antes de executar a instalação.
+O ambiente virtual é uma pasta isolada chamada `.venv` que guarda as bibliotecas usadas pelo projeto. Ele deve ser criado dentro da pasta do projeto:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-O prompt deve mostrar `(.venv)`. Se a ativação for bloqueada pelo PowerShell, execute o Python diretamente pelo ambiente:
+O prompt normalmente passa a mostrar `(.venv)`. Se a ativação for bloqueada pelo PowerShell, não é necessário alterar a política do sistema: use o Python do ambiente diretamente.
+
+### 4. Instale as dependências
+
+Se a ativação funcionou:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Se a ativação não funcionou, use:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Se a ativação funcionar, os comandos equivalentes são:
+### 5. Confirme a instalação
+
+Execute da pasta do projeto:
 
 ```powershell
-py -m pip install --upgrade pip
-py -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-### 3. Validar a instalação
+O primeiro comando não deve relatar dependências quebradas. O segundo deve terminar com `OK`.
+
+## Se a pasta ainda não tiver o projeto
+
+Este é um caso de recuperação, não uma etapa normal da instalação. Se `Test-Path requirements.txt` retornar `False`, escolha uma nova pasta e execute novamente:
 
 ```powershell
-py -m unittest discover -s tests -v
-py -m pip check
+$Projeto = "$HOME\MeusProjetos\filmow_to_letterboxd_essentials-novo"
+New-Item -ItemType Directory -Path $Projeto
+Set-Location $Projeto
+git clone https://github.com/jhojhocraazy/filmow_to_letterboxd_essentials.git .
 ```
+
+Não remova pastas automaticamente. Se a pasta já contiver um ambiente virtual, dados ou outro projeto, escolha outro destino ou faça uma revisão manual antes de qualquer comando destrutivo.
 
 ## Como executar
 
 Depois da instalação, execute com o ambiente virtual ativo:
 
 ```powershell
-py filmow_to_letterboxd_essentials.py
+python filmow_to_letterboxd_essentials.py
+```
+
+Se a ativação não estiver disponível:
+
+```powershell
+.\.venv\Scripts\python.exe filmow_to_letterboxd_essentials.py
 ```
 
 O menu usa esta ordem:
