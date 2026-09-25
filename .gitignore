@@ -3,3 +3,16 @@ tmdb_api.txt
 *.tsv.gz
 relatorio_filmow_*.txt
 __pycache__/
+*.egg-info/
+*.tmp
+*.log
+*.bak
+.env
+.env.*
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db
